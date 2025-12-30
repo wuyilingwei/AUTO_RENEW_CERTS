@@ -1,0 +1,178 @@
+name: Cert Renewal to Custom Vault
+on:
+  schedule:
+    - cron: '0 0 1 * *' # 每月1号运行
+  workflow_dispatch: # 支持手动触发
+
+jobs:
+  cert_renewal:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Process Domains
+        env:
+          DOMAINS_JSON: ${{ vars.DOMAINS_CONFIG }}
+          VAULT_TOKEN: ${{ vars.VAULT_TOKEN }}
+          VAULT_URL: ${{ vars.VAULT_URL }}
+        run: |
+          # Ensure certs directory exists
+          mkdir -p ./certs
+          
+          # Error tracking flag
+          ERROR_FLAG_FILE="job_failed.flag"
+          rm -f "$ERROR_FLAG_FILE"
+
+          # Summary file
+          SUMMARY_FILE="summary_report.txt"
+          echo "Job Summary:" > "$SUMMARY_FILE"
+
+          # Iterate over each domain configuration
+          echo "$DOMAINS_JSON" | jq -c '.[]' | while read -r item; do
+            DOMAIN=$(echo "$item" | jq -r '.domain')
+            EMAIL=$(echo "$item" | jq -r '.email')
+            CF_TOKEN=$(echo "$item" | jq -r '.cf_token')
+            
+            echo "----------------------------------------------------------------"
+            echo "Processing Domain Group: $DOMAIN"
+            echo "----------------------------------------------------------------"
+
+            # Construct domain arguments and list for Vault
+            # Use ONLY apply_domains for the certificate request
+            ALL_DOMAINS=$(echo "$item" | jq -c '(.apply_domains // []) | unique')
+            
+            if [ "$(echo "$ALL_DOMAINS" | jq 'length')" -eq 0 ]; then
+                echo "::warning::No apply_domains found for $DOMAIN. Skipping."
+                echo "- $DOMAIN: ⚠️ Skipped (No apply_domains)" >> "$SUMMARY_FILE"
+                continue
+            fi
+
+            DOMAIN_ARGS=""
+            for d in $(echo "$ALL_DOMAINS" | jq -r '.[]'); do
+                DOMAIN_ARGS="$DOMAIN_ARGS -d $d"
+            done
+
+            echo "Certbot args: $DOMAIN_ARGS"
+            
+            # 1. Create temporary Cloudflare credentials file
+            CF_INI=$(mktemp)
+            echo "dns_cloudflare_api_token = $CF_TOKEN" > "$CF_INI"
+            chmod 600 "$CF_INI"
+
+            # 2. Issue Certificate
+            # Use --cert-name to ensure the output directory matches the config's domain identifier
+            echo "Requesting certificate..."
+            if ! docker run --rm -v "$(pwd)/certs:/etc/letsencrypt" \
+              -v "$CF_INI:/cf.ini" \
+              certbot/dns-cloudflare certonly --non-interactive --agree-tos \
+              --email "$EMAIL" \
+              --dns-cloudflare \
+              --dns-cloudflare-credentials /cf.ini \
+              --dns-cloudflare-propagation-seconds 60 \
+              --cert-name "$DOMAIN" \
+              $DOMAIN_ARGS; then
+                echo "::error::Certbot failed for $DOMAIN"
+                echo "- $DOMAIN: ❌ Certbot Failed" >> "$SUMMARY_FILE"
+                touch "$ERROR_FLAG_FILE"
+                rm -f "$CF_INI"
+                continue
+            fi
+
+            # Fix permissions (Docker creates files as root)
+            sudo chown -R $(id -u):$(id -g) ./certs
+            
+            # Debug: List generated files
+            echo "Listing certs directory:"
+            ls -R ./certs
+
+            # 3. Read and Push to Vault
+            CERT_DIR="./certs/live/$DOMAIN"
+
+            if [ -n "$CERT_DIR" ] && [ -d "$CERT_DIR" ]; then
+                echo "Using certs from $CERT_DIR"
+                # Read files directly (jq will handle escaping newlines to \n)
+                PRIVKEY=$(cat "$CERT_DIR/privkey.pem")
+                CERT=$(cat "$CERT_DIR/cert.pem")
+                FULLCHAIN=$(cat "$CERT_DIR/fullchain.pem")
+                
+                # Construct the JSON payload for Vault
+                # We iterate over ALL_DOMAINS to create keys for each domain in the list
+                echo "$ALL_DOMAINS" | jq \
+                  --arg pk "$PRIVKEY" \
+                  --arg cert "$CERT" \
+                  --arg fc "$FULLCHAIN" \
+                  '{
+                    ops: (map(
+                      . as $d |
+                      [
+                        { id: ("task_pk_" + $d), type: "write", module: "certs", key: ($d + "-privkey"), value: $pk },
+                        { id: ("task_cert_" + $d), type: "write", module: "certs", key: ($d + "-cert"), value: $cert },
+                        { id: ("task_fc_" + $d), type: "write", module: "certs", key: ($d + "-fullchain"), value: $fc }
+                      ]
+                    ) | flatten)
+                  }' > payload.json
+
+                echo "Uploading to Vault..."
+                
+                # Sanitize Token to ensure no newlines break the headers
+                CLEAN_TOKEN=$(echo "$VAULT_TOKEN" | tr -d '\n' | tr -d '\r')
+                
+                # Use temp files for response and debug info
+                RESP_FILE=$(mktemp)
+                DEBUG_FILE=$(mktemp)
+                
+                # Use --http1.1 to reduce complexity
+                # Removed custom WAF headers as requested
+                HTTP_CODE=$(curl -s -v --http1.1 -o "$RESP_FILE" -w "%{http_code}" \
+                  -X POST "$VAULT_URL/api/data" \
+                  -H "Authorization: Bearer $CLEAN_TOKEN" \
+                  -H "Content-Type: application/json" \
+                  -d @payload.json 2> "$DEBUG_FILE")
+
+                echo "HTTP Status: $HTTP_CODE"
+                
+                if [ "$HTTP_CODE" -eq 200 ]; then
+                    echo "Upload complete for $DOMAIN. Response:"
+                    cat "$RESP_FILE"
+                    echo ""
+                    echo "- $DOMAIN: ✅ Success" >> "$SUMMARY_FILE"
+                else
+                    echo "::error::Upload failed for $DOMAIN with status $HTTP_CODE"
+                    echo "Response Body:"
+                    cat "$RESP_FILE"
+                    echo ""
+                    
+                    echo "Debug Info (Request Headers):"
+                    # Print headers sent, masking the token
+                    grep ">" "$DEBUG_FILE" | sed 's/Bearer .*/Bearer ***/'
+                    
+                    echo "- $DOMAIN: ❌ Upload Failed (Status $HTTP_CODE)" >> "$SUMMARY_FILE"
+                    touch "$ERROR_FLAG_FILE"
+                fi
+                rm "$RESP_FILE"
+                rm "$DEBUG_FILE"
+            else
+                echo "::error::Certificates not found for $DOMAIN"
+                echo "- $DOMAIN: ❌ Certificates not found" >> "$SUMMARY_FILE"
+                touch "$ERROR_FLAG_FILE"
+            fi
+
+            # Cleanup
+            rm -f "$CF_INI"
+            rm -f payload.json
+          done
+          
+          # Print Summary
+          echo "=========================================="
+          cat "$SUMMARY_FILE"
+          echo "=========================================="
+          
+          # Final Error Check
+          if [ -f "$ERROR_FLAG_FILE" ]; then
+              echo "::error::Workflow completed with errors in one or more domains."
+              exit 1
+          else
+              echo "All domains processed successfully."
+
+          fi

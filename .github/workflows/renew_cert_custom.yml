@@ -1,0 +1,158 @@
+# ⚠️ INCOMPLETE - 自定义存储服务集成工作流
+#
+# 本文件作为"自定义存储/分发方式"的入口模板
+# 
+# 使用说明：
+# 1. 根据您的存储服务类型（例如 S3, MinIO, Vault 等），修改上传逻辑
+# 2. 证书文件位置：./certs/live/{domain}/
+#    - privkey.pem   : 私钥
+#    - cert.pem      : 证书
+#    - fullchain.pem : 完整证书链
+# 3. 参考 renew_cert.yml 中的 Certbot 证书申请部分
+# 4. 完成后删除本文件顶部的警告注释
+#
+# 如需帮助，请参考 README 中的"自定义集成"章节
+
+name: Cert Renewal with Custom Storage
+on:
+  schedule:
+    - cron: '0 0 1 * *' # 每月1号运行
+  workflow_dispatch: # 支持手动触发
+
+jobs:
+  cert_renewal:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Process Domains
+        env:
+          DOMAINS_JSON: ${{ vars.DOMAINS_CONFIG }}
+        run: |
+          # Ensure certs directory exists
+          mkdir -p ./certs
+          
+          # Error tracking flag
+          ERROR_FLAG_FILE="job_failed.flag"
+          rm -f "$ERROR_FLAG_FILE"
+
+          # Summary file
+          SUMMARY_FILE="summary_report.txt"
+          echo "Job Summary:" > "$SUMMARY_FILE"
+
+          # Iterate over each domain configuration
+          echo "$DOMAINS_JSON" | jq -c '.[]' | while read -r item; do
+            DOMAIN=$(echo "$item" | jq -r '.domain')
+            EMAIL=$(echo "$item" | jq -r '.email')
+            CF_TOKEN=$(echo "$item" | jq -r '.cf_token')
+            
+            echo "----------------------------------------------------------------"
+            echo "Processing Domain Group: $DOMAIN"
+            echo "----------------------------------------------------------------"
+
+            # Construct domain arguments and list for Vault
+            # Use ONLY apply_domains for the certificate request
+            ALL_DOMAINS=$(echo "$item" | jq -c '(.apply_domains // []) | unique')
+            
+            if [ "$(echo "$ALL_DOMAINS" | jq 'length')" -eq 0 ]; then
+                echo "::warning::No apply_domains found for $DOMAIN. Skipping."
+                echo "- $DOMAIN: ⚠️ Skipped (No apply_domains)" >> "$SUMMARY_FILE"
+                continue
+            fi
+
+            DOMAIN_ARGS=""
+            for d in $(echo "$ALL_DOMAINS" | jq -r '.[]'); do
+                DOMAIN_ARGS="$DOMAIN_ARGS -d $d"
+            done
+
+            echo "Certbot args: $DOMAIN_ARGS"
+            
+            # 1. Create temporary Cloudflare credentials file
+            CF_INI=$(mktemp)
+            echo "dns_cloudflare_api_token = $CF_TOKEN" > "$CF_INI"
+            chmod 600 "$CF_INI"
+
+            # 2. Issue Certificate
+            # Use --cert-name to ensure the output directory matches the config's domain identifier
+            echo "Requesting certificate..."
+            if ! docker run --rm -v "$(pwd)/certs:/etc/letsencrypt" \
+              -v "$CF_INI:/cf.ini" \
+              certbot/dns-cloudflare certonly --non-interactive --agree-tos \
+              --email "$EMAIL" \
+              --dns-cloudflare \
+              --dns-cloudflare-credentials /cf.ini \
+              --dns-cloudflare-propagation-seconds 60 \
+              --cert-name "$DOMAIN" \
+              $DOMAIN_ARGS; then
+                echo "::error::Certbot failed for $DOMAIN"
+                echo "- $DOMAIN: ❌ Certbot Failed" >> "$SUMMARY_FILE"
+                touch "$ERROR_FLAG_FILE"
+                rm -f "$CF_INI"
+                continue
+            fi
+
+            # Fix permissions (Docker creates files as root)
+            sudo chown -R $(id -u):$(id -g) ./certs
+            
+            # Debug: List generated files
+            echo "Listing certs directory:"
+            ls -R ./certs
+
+            # 3. 上传至自定义存储服务（TODO: 修改此部分）
+            CERT_DIR="./certs/live/$DOMAIN"
+
+            if [ -n "$CERT_DIR" ] && [ -d "$CERT_DIR" ]; then
+                echo "Using certs from $CERT_DIR"
+                # Read files
+                PRIVKEY=$(cat "$CERT_DIR/privkey.pem")
+                CERT=$(cat "$CERT_DIR/cert.pem")
+                FULLCHAIN=$(cat "$CERT_DIR/fullchain.pem")
+                
+                echo "Uploading to custom storage..."
+                
+                # ⚠️ TODO: 在此处添加您的自定义存储逻辑
+                # 
+                # 例如：
+                # - 上传到 AWS S3
+                # - 上传到自建 MinIO
+                # - 发送到自定义 API 端点
+                # - 同步到远程服务器（SSH/SCP）
+                #
+                # 证书内容已在以下变量中：
+                # - $PRIVKEY   : 私钥内容
+                # - $CERT      : 证书内容
+                # - $FULLCHAIN : 完整证书链
+                
+                # 示例: 将证书保存为文件
+                # mkdir -p "./certs_output"
+                # echo "$PRIVKEY" > "./certs_output/${DOMAIN}-privkey.pem"
+                # echo "$CERT" > "./certs_output/${DOMAIN}-cert.pem"
+                # echo "$FULLCHAIN" > "./certs_output/${DOMAIN}-fullchain.pem"
+                
+                # 如果您的上传命令失败，使用以下方式标记错误：
+                # touch "$ERROR_FLAG_FILE"
+                
+                echo "- $DOMAIN: ✅ Processed" >> "$SUMMARY_FILE"
+            else
+                echo "::error::Certificates not found for $DOMAIN"
+                echo "- $DOMAIN: ❌ Certificates not found" >> "$SUMMARY_FILE"
+                touch "$ERROR_FLAG_FILE"
+            fi
+
+            # Cleanup
+            rm -f "$CF_INI"
+          done
+          
+          # Print Summary
+          echo "=========================================="
+          cat "$SUMMARY_FILE"
+          echo "=========================================="
+          
+          # Final Error Check
+          if [ -f "$ERROR_FLAG_FILE" ]; then
+              echo "::error::Workflow completed with errors in one or more domains."
+              exit 1
+          else
+              echo "All domains processed successfully."
+          fi
