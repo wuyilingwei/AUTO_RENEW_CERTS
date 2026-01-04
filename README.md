@@ -12,7 +12,7 @@
 
 | 工作流                          | 说明                                 | 适用场景                                   |
 | ------------------------------- | ------------------------------------ | ------------------------------------------ |
-| **renew_cert.yml**        | 默认工作流，与 AetherVault SaaS 集成 | 使用 [AetherVault](https://github.com/wuyilingwei/MyVault) 进行统一证书分发与管理    |
+| **renew_cert.yml**        | 默认工作流，与 AetherVault SaaS 集成 | 使用 AetherVault 进行统一证书分发与管理    |
 | **renew_cert_custom.yml** | 自定义存储入口（需自行实现上传逻辑） | 集成私有存储服务（S3、MinIO、自建 API 等） |
 
 ### 选择您的工作流
@@ -254,4 +254,3 @@ https://github.com/wuyilingwei/AUTO_RENEW_CERTS
 4. 添加必要的 GitHub Secrets（如 AWS Access Key、自定义 API Token 等）
 5. 在工作流中使用 Secrets（例如 `${{ secrets.AWS_ACCESS_KEY }}`）
 6. 测试工作流，确保证书成功上传
-
